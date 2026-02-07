@@ -8,15 +8,14 @@ import os
 import torch
 import shutil
 from pathlib import Path
+import json
 
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier
-
-MODEL_ID = "./KD_student_model/checkpoint-768"     
-OUT_DIR  = f"./KD_AWQ_W4A16_model"          
+import argparse
 
 DATASET_ID = "LGAI-EXAONE/MANTA-1M"
 DATASET_SPLIT = "train"
@@ -29,17 +28,17 @@ SCHEME = "W4A16"
 TARGETS = ["Linear"]
 IGNORE  = ["embed_tokens", "lm_head"]
 
-def main():
+def main(args):
 
     print("[INFO] 모델 로드 중...")
 
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_ID,
+        args.model_id,
         trust_remote_code=True,
     )
 
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
+        args.model_id,
         torch_dtype=torch.bfloat16,
     )
 
@@ -84,24 +83,47 @@ def main():
         num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     )
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    model.save_pretrained(OUT_DIR, save_compressed=True)
-    tokenizer.save_pretrained(OUT_DIR)
+    model.save_pretrained(args.out_dir, save_compressed=True)
+    tokenizer.save_pretrained(args.out_dir)
+    
+    # 양자화 정보 명시적 저장 (Marlin 커널이 감지하기 위함)
+    import json
+    config_path = Path(args.out_dir) / "config.json"
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # 양자화 config 추가 (없으면)
+        if 'quantization_config' not in config:
+            config['quantization_config'] = {
+                'quant_method': 'awq',
+                'w_bit': 4,
+                'a_bit': 16,
+                'scheme': 'W4A16'
+            }
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            print("[INFO] 양자화 정보 저장 완료")
 
-    print(f"[INFO] 모델 저장 완료: {OUT_DIR}")
+    print(f"[INFO] 모델 저장 완료: {args.out_dir}")
 
-    zip_name = "KD_AWQ_W4A16_submit"
+    zip_name = args.out_dir
     print(f"[INFO] {zip_name}.zip 생성 중...")
 
     shutil.make_archive(
         base_name=zip_name,
         format="zip",
         root_dir=".",
-        base_dir=OUT_DIR,
+        base_dir=args.out_dir,
     )
 
     print(f"[INFO] 생성 완료: {zip_name}.zip")
     
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="AWQ W4A16 양자화")
+    parser.add_argument("--model_id", type=str, required=True, help="양자화할 모델 경로")
+    parser.add_argument("--out_dir", type=str, default="./KD_AWQ_W4A16_model", help="양자화된 모델 저장 경로")
+    args = parser.parse_args()
+    main(args)  

@@ -88,13 +88,36 @@ def measure_vllm_speed(args) -> None:
     
     total_time = 0.0
     total_tokens = 0
+    total_prompt_tokens = 0
+
+    # 로컬에서 프롬프트 토큰 길이 추정 (서버 usage가 없을 때 대비)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        trust_remote_code=True,
+        use_fast=True,
+    )
     
+    messages = [{"role": "user", "content": args.vllm_prompt}]
     payload_template = {
         "model": args.model_path,
-        "messages": [{"role": "user", "content": args.vllm_prompt}],
+        "messages": messages,
         "temperature": 0.0,
         "max_tokens": int(args.vllm_max_tokens),
     }
+
+    # 프롬프트 토큰 수 추정
+    try:
+        if args.apply_chat_template and hasattr(tokenizer, "apply_chat_template"):
+            prompt_tokens_est = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True
+            )
+            prompt_tokens_est = len(prompt_tokens_est)
+        else:
+            prompt_tokens_est = len(tokenizer.encode(args.vllm_prompt))
+        print(f"[프롬프트 토큰 추정] {prompt_tokens_est} tokens")
+    except Exception as e:
+        print(f"[경고] 프롬프트 토큰 추정 실패: {e}")
+        prompt_tokens_est = None
     
     for i in range(int(args.vllm_num_requests)):
         try:
@@ -110,18 +133,32 @@ def measure_vllm_speed(args) -> None:
                 result = json.loads(resp.read().decode("utf-8"))
             elapsed = time.perf_counter() - start
             
-            completion_tokens = result.get("usage", {}).get("completion_tokens", 0)
+            usage = result.get("usage", {})
+            completion_tokens = usage.get("completion_tokens", 0)
+            prompt_tokens = usage.get("prompt_tokens", 0)
             total_time += elapsed
             total_tokens += completion_tokens
+            total_prompt_tokens += prompt_tokens
             
-            print(f"  [{i+1}/{int(args.vllm_num_requests)}] {elapsed:.3f}s, {completion_tokens} tokens")
+            if prompt_tokens:
+                print(f"  [{i+1}/{int(args.vllm_num_requests)}] {elapsed:.3f}s, prompt {prompt_tokens}, completion {completion_tokens} tokens")
+            else:
+                print(f"  [{i+1}/{int(args.vllm_num_requests)}] {elapsed:.3f}s, {completion_tokens} tokens")
         except URLError as e:
             print(f"[ERROR] vLLM 연결 실패: {e}")
             return
     
     if total_tokens > 0:
         tpt = total_time / total_tokens
-        print(f"\n[결과] TPT: {tpt:.6f}s/token ({1/tpt:.2f} tokens/s)")
+        tps = 1 / tpt
+        print(f"\n[결과] TPT: {tpt:.6f}s/token ({tps:.2f} tokens/s)")
+        if total_prompt_tokens > 0:
+            avg_prompt = total_prompt_tokens / int(args.vllm_num_requests)
+            print(f"[결과] 평균 프롬프트 토큰: {avg_prompt:.1f}")
+        if prompt_tokens_est:
+            est_total = prompt_tokens_est + int(args.vllm_max_tokens)
+            est_time = est_total / tps
+            print(f"[예상] (프롬프트+생성) {est_total} tokens -> {est_time/60:.2f} min")
 
 
 # ============================================================================
@@ -130,14 +167,14 @@ def measure_vllm_speed(args) -> None:
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="모델 평가 스크립트")
-    parser.add_argument("--model_path", type=str, default="./KD_student_model", help="평가할 모델 경로")
+    parser.add_argument("--model_path", type=str, default="./KD_student_W4A16_model", help="평가할 모델 경로")
     parser.add_argument("--lm_eval_tasks", type=str, default="hellaswag", help="평가할 작업 (쉼표로 구분)")
     parser.add_argument("--lm_eval_batch_size", type=str, default="auto", help="배치 크기")
     parser.add_argument("--lm_eval_device", type=str, default="cuda:0", help="평가 디바이스")
     parser.add_argument("--vllm_base_url", type=str, default="http://127.0.0.1:8000", help="vLLM 서버 주소")
     parser.add_argument("--vllm_prompt", type=str, default="where is the capital of france?", help="vLLM 프롬프트")
     parser.add_argument("--vllm_num_requests", type=int, default=5, help="vLLM 요청 횟수")
-    parser.add_argument("--vllm_max_tokens", type=int, default=256, help="최대 생성 토큰")
+    parser.add_argument("--vllm_max_tokens", type=int, default=4096, help="최대 생성 토큰")
     parser.add_argument("--lm_eval_dir", type=str, default="./lm-evaluation-harness", help="lm-eval 디렉토리")
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="vLLM 텐서 병렬화 크기")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.85, help="GPU 메모리 사용률")

@@ -24,3 +24,8 @@ __pycache__/
 /ds_kd_zero3.json
 /model.zip
 /submit.zip
+/KD_student_model_v2/
+/KD_student_model_v3/
+/Marlin_AWQ_W4A16_model/
+/fail_models/
+/model_marlin.zip

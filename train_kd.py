@@ -51,23 +51,25 @@ class Method(str, Enum):
 
 # ─────────────── Student Builder (Bottom-Heavy + Top) ───────────
 
-def build_student(teacher, n_layers: int = 20):
+def build_student(teacher, n_layers: int = 15):
     """
     Bottom-Heavy + Top 전략으로 Student 생성.
 
-    Teacher 30L → Student 20L 예시:
-      Layer 0~18 (하위 19개, 연속) + Layer 29 (최상위 1개) = 총 20개
+    Teacher 30L → Student 15L 예시:
+      Layer 0~13 (하위 14개, 연속) + Layer 29 (최상위 1개) = 총 15개
       → Feature 연속성 보존 + 최종 추론 레이어 유지
 
-    기존 np.linspace 균등 선택은 중간 Feature가 끊겨 Model Collapse 유발.
+    Args:
+        teacher: Teacher 모델
+        n_layers: Student 레이어 수
     """
     cfg = teacher.config.to_dict()
     orig = cfg["num_hidden_layers"]
 
     # ── Bottom-Heavy + Top 인덱스 계산 ──
-    n_bottom = n_layers - 1          # 19개: 연속된 하위 레이어
-    top_idx  = orig - 1              # 29: 최상위 레이어
-    indices  = list(range(n_bottom)) + [top_idx]  # [0,1,2,...,18,29]
+    n_bottom = n_layers - 1
+    top_idx  = orig - 1
+    indices  = list(range(n_bottom)) + [top_idx]
 
     assert len(indices) == n_layers, f"인덱스 수 불일치: {len(indices)} != {n_layers}"
 
@@ -84,8 +86,13 @@ def build_student(teacher, n_layers: int = 20):
 
     # 비-레이어 파라미터 (embedding, lm_head, final_norm 등)
     layer_pat = re.compile(r"(\.layers\.)(\d+)(\..*)")
+    embed_ignore = ["embed_tokens", "lm_head"]
+    
     for k in t_sd:
         if not layer_pat.search(k):
+            # embedding/lm_head는 스킵
+            if any(ig in k for ig in embed_ignore):
+                continue
             if k in s_sd and t_sd[k].shape == s_sd[k].shape:
                 s_sd[k] = t_sd[k].clone()
                 copied += 1
@@ -119,13 +126,26 @@ class Projector(nn.Module):
 
 # ───────────────────────── Loss Functions ───────────────────────
 
-def loss_kd(s_logits, t_logits, labels, T: float, alpha: float):
-    """CE + KL-Divergence soft target loss."""
+def loss_kd(s_logits, t_logits, labels, T: float, alpha: float,
+           eos_id: int | None = None, eos_weight: float = 1.0):
+    """CE + KL-Divergence soft target loss (EOS 가중치 지원)."""
     s = s_logits[:, :-1].contiguous()
     t = t_logits[:, :-1].contiguous()
     lab = labels[:, 1:].contiguous()
 
-    ce = F.cross_entropy(s.view(-1, s.size(-1)), lab.view(-1), ignore_index=-100)
+    # ── EOS-weighted CE ──
+    if eos_id is not None and eos_weight > 1.0:
+        ce_per_tok = F.cross_entropy(
+            s.view(-1, s.size(-1)), lab.view(-1),
+            ignore_index=-100, reduction="none",
+        )
+        eos_mask = (lab.view(-1) == eos_id).float()
+        weights = torch.ones_like(ce_per_tok) + eos_mask * (eos_weight - 1.0)
+        valid = (lab.view(-1) != -100).float()
+        ce = (ce_per_tok * weights * valid).sum() / (valid.sum() + 1e-8)
+    else:
+        ce = F.cross_entropy(s.view(-1, s.size(-1)), lab.view(-1), ignore_index=-100)
+
     kl = F.kl_div(
         F.log_softmax(s / T, dim=-1),
         F.softmax(t / T, dim=-1),
@@ -167,17 +187,40 @@ def loss_mse(s_logits, t_logits, s_hid, t_hid, labels,
 # ──────────────────────── Dataset Prep ──────────────────────────
 
 def make_dataset(tokenizer, dataset_id: str, split: str, n_samples: int, max_len: int):
-    """LGAI-EXAONE/MANTA-1M 데이터셋 로드 & 토크나이즈."""
+    """
+    LGAI-EXAONE/MANTA-1M 데이터셋 로드 & 토크나이즈.
+    
+    ⚠️ 중요: EOS 토큰 처리
+    ────────────────────────────────────
+    
+    [잘못된 방식] - 모델이 언제 끝나는지 모름
+      text = f"{prompt}\n{response}"  # EOS 없음
+      → 모델이 계속 생성 (max_new_tokens까지)
+    
+    [올바른 방식] - 모델이 EOS 학습
+      text = f"{prompt}\n{response}{tokenizer.eos_token}"
+      → 모델이 EOS 생성하는 법 배움
+    
+    max_seq_len 설정과 무관하게:
+      - max_seq_len=512로 설정해도, 데이터의 마지막 토큰이 잘릴 수 있음
+      - 따라서 tokenize 전에 반드시 EOS 토큰을 텍스트에 추가해야 함
+      - tokenize 후 truncate되면 EOS가 손실될 수 있으므로 미리 붙임
+    """
     ds = load_dataset(dataset_id, split=f"{split}[:{n_samples}]")
 
+    eos_token = tokenizer.eos_token or ""
+
     def _chat_to_text(ex):
-        return {
-            "text": tokenizer.apply_chat_template(
-                ex["conversations"],
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-        }
+        text = tokenizer.apply_chat_template(
+            ex["conversations"],
+            add_generation_prompt=False,   # 학습: 전체 대화 포함
+            tokenize=False,
+        )
+        # ✓ EOS 토큰을 명시적으로 추가 (tokenize 전)
+        # 이렇게 해야 truncate되어도 일부 EOS 신호가 남음
+        if eos_token and not text.rstrip().endswith(eos_token):
+            text = text.rstrip() + eos_token
+        return {"text": text}
 
     ds = ds.map(_chat_to_text, remove_columns=ds.column_names)
     ds = ds.map(
@@ -194,19 +237,22 @@ def main():
     # ── CLI Args ──
     parser = argparse.ArgumentParser(description="KD for CausalLM (DeepSpeed v3)")
     parser.add_argument("--teacher_model",    default="./base_model")
-    parser.add_argument("--out_dir",          default="./KD_student_model_v3")
-    parser.add_argument("--student_layers",   type=int, default=24)
+    parser.add_argument("--out_dir",          default="./KD_student_model_v4")
+    parser.add_argument("--student_layers",   type=int, default=15)
     parser.add_argument("--dataset_id",       default="LGAI-EXAONE/MANTA-1M")
     parser.add_argument("--dataset_split",    default="train")
-    parser.add_argument("--num_samples",      type=int, default=1024)
-    parser.add_argument("--max_seq_len",      type=int, default=256)
-    parser.add_argument("--epochs",           type=int, default=3)
+    parser.add_argument("--num_samples",      type=int, default=2048)
+    parser.add_argument("--max_seq_len",      type=int, default=1024,
+                        help="충분히 길어야 EOS 토큰 학습 가능 (권장: 512+)")
+    parser.add_argument("--epochs",           type=int, default=5)
     parser.add_argument("--batch_size",       type=int, default=1)
     parser.add_argument("--method",           type=Method, default=Method.KD,
                         choices=list(Method))
     parser.add_argument("--temperature",      type=float, default=1.5)
     parser.add_argument("--alpha_ce",         type=float, default=0.8)
     parser.add_argument("--beta_aux",         type=float, default=0.2)
+    parser.add_argument("--eos_weight",       type=float, default=5.0,
+                        help="EOS 토큰 CE 가중치 (1.0=기본, 5.0=5배 강조)")
     parser.add_argument("--log_every",        type=int, default=10)
     parser.add_argument("--ds_config",        type=str, default="./ds_kd_zero3.json",
                         help="DeepSpeed JSON config 경로")
@@ -366,6 +412,7 @@ def main():
                 loss, ce, aux = loss_kd(
                     s_out.logits, t_out.logits, labs,
                     args.temperature, args.alpha_ce,
+                    eos_id=tok.eos_token_id, eos_weight=args.eos_weight,
                 )
             elif args.method == Method.COSINE:
                 loss, ce, aux = loss_cosine(

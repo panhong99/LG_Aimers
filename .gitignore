@@ -29,3 +29,9 @@ __pycache__/
 /Marlin_AWQ_W4A16_model/
 /fail_models/
 /model_marlin.zip
+/KD_packed_submit/
+/KD_student_model_v3.zip
+/KD_student_model_v3_.zip
+/KD_student_model_v3_vllm/
+/awq_base.zip
+/awq_base/

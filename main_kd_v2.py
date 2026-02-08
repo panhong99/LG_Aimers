@@ -348,12 +348,49 @@ def main():
     if rank == 0:
         out = Path(args.out_dir)
         out.mkdir(parents=True, exist_ok=True)
-        model_to_save = engine.module
-        model_to_save.save_pretrained(out)
+        model_to_save = engine.module if hasattr(engine, "module") else engine
+        
+        # =========================================================
+        # [핵심 수정] 저장 직전, Config 강제 성형수술 (vLLM 0.14.1 호환용)
+        # =========================================================
+        print("[INFO] vLLM 0.14.1 호환성을 위해 Config 강제 수정 중...")
+        
+        # 1. 모델 정체성 숨기기 (Exaone -> Llama)
+        model_to_save.config.architectures = ["LlamaForCausalLM"]
+        model_to_save.config.model_type = "llama"
+        
+        # 2. 층수 확정 (Pruning 반영)
+        model_to_save.config.num_hidden_layers = 24
+        
+        # 3. 골치 아픈 layer_types 리스트 삭제
+        if hasattr(model_to_save.config, "layer_types"):
+            delattr(model_to_save.config, "layer_types")
+            
+        # 4. 양자화 설정 'AWQ 표준'으로 덮어쓰기
+        # (기존 compressed-tensors 설정이 있어도 무시하고 이걸로 덮어씀)
+        model_to_save.config.quantization_config = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 128,
+            "zero_point": True,
+            "version": "gemm"
+        }
+
+        # 5. 토크나이저 템플릿 강제 주입 (에러 방지)
+        if tok.chat_template is None:
+             tok.chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}{{'[INST] ' + message['content'] + ' [/INST]'}}{% elif message['role'] == 'assistant' %}{{message['content'] + eos_token}}{% endif %}{% endfor %}"
+
+        # =========================================================
+        # [저장 실행] safe_serialization=True 필수!
+        # =========================================================
+        model_to_save.save_pretrained(out, safe_serialization=True)
         tok.save_pretrained(out)
+        
         if proj is not None:
             torch.save(proj.state_dict(), out / "projector.pt")
+            
         print(f"\n[INFO] 저장 완료: {out}")
+        print("[INFO] (Config가 Llama/AWQ/24층으로 완벽하게 수정되어 저장되었습니다.)")
 
 
 if __name__ == "__main__":

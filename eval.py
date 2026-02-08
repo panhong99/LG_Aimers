@@ -167,7 +167,7 @@ def measure_vllm_speed(args) -> None:
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="모델 평가 스크립트")
-    parser.add_argument("--model_path", type=str, default="./KD_student_W4A16_model", help="평가할 모델 경로")
+    parser.add_argument("--model_path", type=str, default="./KD_student_model_v3", help="평가할 모델 경로")
     parser.add_argument("--lm_eval_tasks", type=str, default="hellaswag", help="평가할 작업 (쉼표로 구분)")
     parser.add_argument("--lm_eval_batch_size", type=str, default="auto", help="배치 크기")
     parser.add_argument("--lm_eval_device", type=str, default="cuda:0", help="평가 디바이스")
@@ -185,9 +185,9 @@ if __name__ == "__main__":
     # lm_eval_tasks를 리스트로 변환
     args.lm_eval_tasks = [t.strip() for t in args.lm_eval_tasks.split(",")]
     
-    # print_model_params(args.model_path)
+    print_model_params(args.model_path)
     # run_eval(args)
-    measure_vllm_speed(args)
+    # measure_vllm_speed(args)
     print("\n" + "=" * 70)
     print("완료")
     print("=" * 70)

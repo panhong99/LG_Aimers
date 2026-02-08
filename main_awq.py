@@ -124,6 +124,6 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AWQ W4A16 양자화")
     parser.add_argument("--model_id", type=str, required=True, help="양자화할 모델 경로")
-    parser.add_argument("--out_dir", type=str, default="./KD_AWQ_W4A16_model", help="양자화된 모델 저장 경로")
+    parser.add_argument("--out_dir", type=str, default="./awq_base", help="양자화된 모델 저장 경로")
     args = parser.parse_args()
     main(args)  

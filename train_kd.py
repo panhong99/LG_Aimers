@@ -1,12 +1,12 @@
 """
-Knowledge Distillation for Causal LM — DeepSpeed Native (v3)
+Knowledge Distillation for Causal LM — Single GPU (v4)
 
-개선 사항 (v2 대비):
+설계:
   - Bottom-Heavy + Top 레이어 선택 전략 (Feature 연속성 보존)
   - Teacher 4-bit NF4 양자화 (OOM 방지)
-  - Flash Attention 2 (Teacher & Student 모두)
-  - DeepSpeed config 기반 Optimizer (수동 생성 안 함)
-  - 안정적 Hyperparameter 기본값 (lr=2e-5, max_seq_len=2048)
+  - SDPA Attention (Teacher & Student 모두)
+  - 강화된 EOS 가중치 학습 (기본 10.0) → 생성 시 EOS 정상 출력
+  - 단순화: 단일 GPU, 일반 PyTorch만 사용
 
 3가지 KD 방법:
   kd     : CE + KL-Divergence (soft targets)
@@ -14,7 +14,7 @@ Knowledge Distillation for Causal LM — DeepSpeed Native (v3)
   mse    : CE + MSE Loss (hidden states, optional projector)
 
 Usage:
-  deepspeed --num_gpus=2 train_kd.py --method kd --epochs 3
+  python train_kd.py --epochs 5 --eos_weight 10.0
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from enum import Enum
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -37,7 +37,6 @@ from transformers import (
     BitsAndBytesConfig,
     DataCollatorForLanguageModeling,
 )
-import deepspeed
 from tqdm import tqdm
 
 
@@ -245,28 +244,28 @@ def main():
     parser.add_argument("--max_seq_len",      type=int, default=1024,
                         help="충분히 길어야 EOS 토큰 학습 가능 (권장: 512+)")
     parser.add_argument("--epochs",           type=int, default=5)
-    parser.add_argument("--batch_size",       type=int, default=1)
+    parser.add_argument("--batch_size",       type=int, default=2)
     parser.add_argument("--method",           type=Method, default=Method.KD,
                         choices=list(Method))
     parser.add_argument("--temperature",      type=float, default=1.5)
     parser.add_argument("--alpha_ce",         type=float, default=0.8)
     parser.add_argument("--beta_aux",         type=float, default=0.2)
-    parser.add_argument("--eos_weight",       type=float, default=5.0,
-                        help="EOS 토큰 CE 가중치 (1.0=기본, 5.0=5배 강조)")
+    parser.add_argument("--eos_weight",       type=float, default=10.0,
+                        help="EOS 토큰 CE 가중치 (기본 10.0 = 10배 강조)")
     parser.add_argument("--log_every",        type=int, default=10)
-    parser.add_argument("--ds_config",        type=str, default="./ds_kd_zero3.json",
-                        help="DeepSpeed JSON config 경로")
-    # DeepSpeed가 자동으로 --local_rank 주입
-    parser.add_argument("--local_rank",       type=int, default=0)
-    parser = deepspeed.add_config_arguments(parser)
+    parser.add_argument("--save_freq",       type=int, default=100,
+                        help="Checkpoint 저장 주기 (steps)")
+    parser.add_argument("--checkpoint_dir",  type=str, default="./checkpoints",
+                        help="Checkpoint 저장 디렉토리")
+    parser.add_argument("--lr",              type=float, default=2e-5)
+    parser.add_argument("--weight_decay",    type=float, default=0.0)
     args = parser.parse_args()
 
-    # ── Distributed 환경 ──
-    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
-    rank       = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
+    # ── 단일 GPU 설정 ──
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cpu":
+        print("[WARNING] GPU를 사용할 수 없습니다. CPU로 실행합니다.")
+    rank = 0
 
     # ── Tokenizer ──
     tok = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
@@ -294,29 +293,12 @@ def main():
     if hasattr(student.config, "_attn_implementation"):
         student.config._attn_implementation = "sdpa"
 
-    # bf16 teacher 삭제 → VRAM 확보
-    del teacher_bf16
-    import gc; gc.collect()
-    torch.cuda.empty_cache()
-
-    # ── Phase 2: Teacher 4-bit NF4 재로드 (추론 전용) ──
+    # ── Phase 2: Teacher bf16 유지 (정확한 KD target) ──
+    # bf16 teacher는 그대로 유지 (4-bit는 정보 손실 → KD 성능 저하)
+    # VRAM: ~6GB (batch size 2에서 총 ~17GB, 충분함)
+    teacher = teacher_bf16.to(device)
     if rank == 0:
-        print(f"[INFO] Teacher 재로드 (4-bit NF4, 추론용): {args.teacher_model}")
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-
-    teacher = AutoModelForCausalLM.from_pretrained(
-        args.teacher_model,
-        quantization_config=bnb_config,
-        device_map={"": device},
-        trust_remote_code=True,
-        attn_implementation="sdpa",
-    ).eval()
+        print(f"[INFO] Teacher 유지 (bf16 정밀도, KD target 정확도 최대): {args.teacher_model}")
 
     for p in teacher.parameters():
         p.requires_grad = False
@@ -338,20 +320,13 @@ def main():
     ds = make_dataset(tok, args.dataset_id, args.dataset_split,
                       args.num_samples, args.max_seq_len)
     collator = DataCollatorForLanguageModeling(tokenizer=tok, mlm=False)
-    sampler  = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True)
     loader   = DataLoader(ds, batch_size=args.batch_size,
-                          sampler=sampler, collate_fn=collator)
+                          shuffle=True, collate_fn=collator)
 
     if rank == 0:
         print(f"[INFO] 데이터셋: {len(ds)} 샘플, Steps/epoch: {len(loader)}")
 
-    # ── DeepSpeed 초기화 (Optimizer는 JSON config에서 자동 생성) ──
-    with open(args.ds_config) as f:
-        ds_config = json.load(f)
-
-    params = list(student.parameters()) + extra_params
-
-    # ── 학습 정보 출력 (DeepSpeed 초기화 전에) ──
+    # ── 학습 정보 출력 ──
     if rank == 0:
         t_p = sum(p.numel() for p in teacher.parameters()) / 1e9
         s_p = sum(p.numel() for p in student.parameters()) / 1e9
@@ -362,30 +337,34 @@ def main():
         print(f"  Student         : {s_p:.2f}B params ({s_p/t_p*100:.0f}%)")
         print(f"  Temperature     : {args.temperature}")
         print(f"  α(CE)={args.alpha_ce}  β(aux)={args.beta_aux}")
-        print(f"  Epochs={args.epochs}  Batch/GPU={args.batch_size}  GPUs={world_size}")
+        print(f"  Epochs={args.epochs}  Batch size={args.batch_size}  Device={device}")
         print(f"  max_seq_len     : {args.max_seq_len}")
         print(f"  num_samples     : {args.num_samples}")
         print(f"  Steps/epoch     : {len(loader)}")
-        print(f"  Optimizer       : from DeepSpeed config ({args.ds_config})")
+        print(f"  Optimizer       : AdamW (lr={args.lr}, wd={args.weight_decay})")
+        print(f"  EOS weight      : {args.eos_weight} (가중치 학습)")
         print(f"{'='*60}\n")
 
-    engine, optimizer, _, scheduler = deepspeed.initialize(
-        model=student,
-        model_parameters=params,
-        config=ds_config,
-    )
+    params = list(student.parameters()) + extra_params
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+
+    # ── Checkpoint 디렉토리 준비 ──
+    ckpt_dir = Path(args.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_loss = float('inf')
+    best_ckpt_path = ckpt_dir / "best_model"
 
     # ── Training Loop ──
     need_hidden = args.method != Method.KD
     global_step = 0
 
     for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
-        engine.train()
+        student.train()
         running = {"loss": 0.0, "ce": 0.0, "aux": 0.0}
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}",
-                    disable=(rank != 0))
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        epoch_loss = 0.0
+        epoch_steps = 0
 
         for batch in pbar:
             ids  = batch["input_ids"].to(device)
@@ -400,8 +379,8 @@ def main():
                     output_hidden_states=need_hidden,
                 )
 
-            # Student forward (through DeepSpeed engine)
-            s_out = engine(
+            # Student forward
+            s_out = student(
                 input_ids=ids,
                 attention_mask=mask,
                 output_hidden_states=need_hidden,
@@ -427,17 +406,28 @@ def main():
                     labs, args.alpha_ce, args.beta_aux, proj,
                 )
 
-            # DeepSpeed backward + step (optimizer.step, zero_grad 자동)
-            engine.backward(loss)
-            engine.step()
+            # Backward + step
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
             # Logging
             running["loss"] += loss.item()
             running["ce"]   += ce
             running["aux"]  += aux
+            epoch_loss += loss.item()
+            epoch_steps += 1
             global_step += 1
 
-            if global_step % args.log_every == 0 and rank == 0:
+            # ── Periodic Checkpoint ──
+            if global_step % args.save_freq == 0:
+                ckpt_path = ckpt_dir / f"step_{global_step}"
+                student.save_pretrained(ckpt_path, safe_serialization=True)
+                if proj is not None:
+                    torch.save(proj.state_dict(), ckpt_path / "projector.pt")
+                print(f"  [CKPT] Step {global_step}: {ckpt_path}")
+
+            if global_step % args.log_every == 0:
                 n = args.log_every
                 pbar.set_postfix(
                     loss=f"{running['loss']/n:.4f}",
@@ -446,19 +436,41 @@ def main():
                 )
                 running = {"loss": 0.0, "ce": 0.0, "aux": 0.0}
 
-        if rank == 0:
-            print(f"  ✓ Epoch {epoch+1} 완료 (global_step={global_step})")
+        # ── Epoch 완료: Best loss 확인 ──
+        avg_epoch_loss = epoch_loss / epoch_steps
+        print(f"  ✓ Epoch {epoch+1} 완료 (avg_loss={avg_epoch_loss:.4f}, global_step={global_step})")
+        
+        # ── Best model 저장 ──
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            student.save_pretrained(best_ckpt_path, safe_serialization=True)
+            tok.save_pretrained(best_ckpt_path)
+            if proj is not None:
+                torch.save(proj.state_dict(), best_ckpt_path / "projector.pt")
+            print(f"  ★ Best model 업데이트: loss={best_loss:.4f} → {best_ckpt_path}")
 
-    # ── 모델 저장 (rank 0) ──
-    if rank == 0:
-        out = Path(args.out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        model_to_save = engine.module
-        model_to_save.save_pretrained(out)
-        tok.save_pretrained(out)
-        if proj is not None:
-            torch.save(proj.state_dict(), out / "projector.pt")
-        print(f"\n[INFO] 저장 완료: {out}")
+    # ── 모델 저장 (단순화: DDP 미사용) ──
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    student.save_pretrained(out, safe_serialization=True)
+    tok.save_pretrained(out)
+
+    if proj is not None:
+        torch.save(proj.state_dict(), out / "projector.pt")
+
+    # 저장 검증: lm_head shape 확인
+    from safetensors.torch import safe_open
+    sf_path = out / "model.safetensors"
+    if sf_path.exists():
+        with safe_open(sf_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if "lm_head" in key or "embed" in key:
+                    t = f.get_tensor(key)
+                    status = "✓" if t.numel() > 0 else "✗ BROKEN"
+                    print(f"  {status} {key}: {t.shape}")
+
+    print(f"\n[INFO] 저장 완료: {out}")
 
 
 if __name__ == "__main__":

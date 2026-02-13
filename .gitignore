@@ -35,3 +35,4 @@ __pycache__/
 /KD_student_model_v3_vllm/
 /awq_base.zip
 /awq_base/
+/KD_student_model_v4

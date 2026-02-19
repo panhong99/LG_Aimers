@@ -42,3 +42,5 @@ __pycache__/
 /trainer_output_v2/
 /trainer_output_v3/
 /wandb/
+/trainer_output_v7_18layers/
+/models

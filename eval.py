@@ -7,6 +7,7 @@ from datetime import datetime
 import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import json as json_lib
 
 # ============================================================================
 # 1. 모델 파라미터 출력
@@ -16,12 +17,41 @@ def print_model_params(model_path: str) -> None:
     print("모델 정보")
     print("=" * 70)
     
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        dtype=torch.bfloat16,
-        device_map="auto"
-    )
+    # GPTQ 모델 감지
+    config_path = Path(model_path) / "config.json"
+    is_gptq = False
     
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            config = json_lib.load(f)
+        is_gptq = 'quantization_config' in config and config['quantization_config'].get('quant_method') == 'gptq'
+    
+    # 모델 로드 (GPTQ 여부에 따라)
+    if is_gptq:
+        print("[INFO] GPTQ 모델 감지 - AutoGPTQForCausalLM으로 로드")
+        try:
+            from auto_gptq import AutoGPTQForCausalLM
+            model = AutoGPTQForCausalLM.from_quantized(
+                model_path,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+        except Exception as e:
+            print(f"[WARNING] GPTQ 로드 실패: {e}")
+            print("[FALLBACK] AutoModelForCausalLM으로 시도")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
     total_params = sum(p.numel() for p in model.parameters())
     
     print(f"파라미터: {total_params / 1e9:.2f}B")
@@ -140,6 +170,18 @@ def measure_vllm_speed(args) -> None:
             total_tokens += completion_tokens
             total_prompt_tokens += prompt_tokens
             
+            # 첫 번째 요청일 때만 질문과 답변 출력
+            if i == 0:
+                print(f"\n[질문 (Prompt)]")
+                print(f"  {args.vllm_prompt}")
+                
+                choices = result.get("choices", [])
+                if choices:
+                    response_text = choices[0].get("message", {}).get("content", "")
+                    print(f"\n[답변 (Response)]")
+                    print(f"  {response_text}")
+                print()
+            
             if prompt_tokens:
                 print(f"  [{i+1}/{int(args.vllm_num_requests)}] {elapsed:.3f}s, prompt {prompt_tokens}, completion {completion_tokens} tokens")
             else:
@@ -167,7 +209,7 @@ def measure_vllm_speed(args) -> None:
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="모델 평가 스크립트")
-    parser.add_argument("--model_path", type=str, default="./KD_student_model_v3", help="평가할 모델 경로")
+    parser.add_argument("--model_path", type=str, default="./trainer_output_v6", help="평가할 모델 경로")
     parser.add_argument("--lm_eval_tasks", type=str, default="hellaswag", help="평가할 작업 (쉼표로 구분)")
     parser.add_argument("--lm_eval_batch_size", type=str, default="auto", help="배치 크기")
     parser.add_argument("--lm_eval_device", type=str, default="cuda:0", help="평가 디바이스")
@@ -185,9 +227,9 @@ if __name__ == "__main__":
     # lm_eval_tasks를 리스트로 변환
     args.lm_eval_tasks = [t.strip() for t in args.lm_eval_tasks.split(",")]
     
-    print_model_params(args.model_path)
+    # print_model_params(args.model_path)
     # run_eval(args)
-    # measure_vllm_speed(args)
+    measure_vllm_speed(args)
     print("\n" + "=" * 70)
     print("완료")
     print("=" * 70)

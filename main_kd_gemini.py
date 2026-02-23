@@ -186,7 +186,14 @@ def main():
         trust_remote_code=True,
         device_map="auto" # Student는 GPU에 자동 할당
     )
-    student_model = smart_prune_model(student_model, model_args.target_layers)
+
+    # ★ 이미 프루닝된 모델이면 스킵, 아니면 프루닝
+    if student_model.config.num_hidden_layers != model_args.target_layers:
+        student_model = smart_prune_model(student_model, model_args.target_layers)
+        print(f"✂️ 프루닝 실행: {student_model.config.num_hidden_layers} → {model_args.target_layers}")
+    else:
+        print(f"✅ 이미 {model_args.target_layers}개 레이어 구조 - 프루닝 스킵")
+
     student_model.gradient_checkpointing_enable()
 
     # [2] Teacher 로드 (4-bit Quantization)

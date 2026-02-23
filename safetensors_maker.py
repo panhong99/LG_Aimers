@@ -2,7 +2,7 @@ from safetensors.torch import load_file, save_file
 from pathlib import Path
 import os
 
-model_path = './model_KD_v6_GPTQ'
+model_path = './model_KD_v6_GPTQ_v2'
 safetensors_file = os.path.join(model_path, "model.safetensors")
 
 # 다시 'model.' 접두어를 붙여서 Transformers 호환용으로 변경

@@ -11,16 +11,16 @@ from llmcompressor.modifiers.quantization import GPTQModifier
 # =============================================================================
 # 1. 설정 및 경로
 # =============================================================================
-MODEL_ID = "./trainer_output_v6"     
-OUT_DIR  = "./model_KD_v6_GPTQ"          
+MODEL_ID = "./models/trainer_output_v6"     
+OUT_DIR  = "./model_KD_v6_GPTQ_v2"          
 
 DATASET_ID = "LGAI-EXAONE/MANTA-1M"
 DATASET_SPLIT = "train"
 
 # [보완] 샘플 수를 256 -> 512로 늘려 정밀도 향상
-NUM_CALIBRATION_SAMPLES = 512 
+NUM_CALIBRATION_SAMPLES = 256 
 # [보완] 학습 시 설정했던 max_seq_length와 동일하게 맞춤
-MAX_SEQUENCE_LENGTH = 256 
+MAX_SEQUENCE_LENGTH = 512
 
 print("[INFO] 모델 및 토크나이저 로드 중...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -56,7 +56,7 @@ recipe = [
         targets=["Linear"],
         ignore=["embed_tokens", "lm_head"],
         # [추가] 가중치 업데이트 시의 감쇠율을 조절하여 급격한 변화 방지
-        dampening_frac=0.1, 
+        dampening_frac=0.01, 
     )
 ]
 
@@ -76,11 +76,30 @@ os.makedirs(OUT_DIR, exist_ok=True)
 model.save_pretrained(OUT_DIR, save_compressed=True)
 tokenizer.save_pretrained(OUT_DIR)
 
-# [보완] 앞서 겪었던 vLLM의 KeyError 방지를 위해 'model.' 접두어 제거 로직 추가
-from safetensors.torch import load_file, save_file
-for safetensors_file in Path(OUT_DIR).glob("*.safetensors"):
-    weights = load_file(str(safetensors_file), device="cpu")
-    fixed_weights = {k.replace("model.", "") if k.startswith("model.") else k: v for k, v in weights.items()}
-    save_file(fixed_weights, str(safetensors_file))
+# [보완] 가중치 키 정규화: vLLM과 Transformers 호환성 보장
+def normalize_safetensors_keys(output_dir):
+    """
+    safetensors 파일의 가중치 키를 정규화:
+    - "model.model." 중복 제거
+    - 최종 형식: "model.layers.*" 등으로 통일
+    """
+    from safetensors.torch import load_file, save_file
+    
+    for safetensors_file in Path(output_dir).glob("*.safetensors"):
+        print(f"  정규화 중: {safetensors_file.name}")
+        weights = load_file(str(safetensors_file), device="cpu")
+        fixed_weights = {}
+        
+        for k, v in weights.items():
+            # "model.model.*" 형태면 "model." 하나만 남기기
+            if k.startswith("model.model."):
+                new_key = k.replace("model.model.", "model.", 1)
+            else:
+                new_key = k
+            fixed_weights[new_key] = v
+        
+        save_file(fixed_weights, str(safetensors_file))
+        print(f"    ✓ 완료 (총 {len(fixed_weights)} 가중치)")
 
-print(f"[INFO] 모델 저장 및 가중치 키 보정 완료: {OUT_DIR}")
+normalize_safetensors_keys(OUT_DIR)
+print(f"[INFO] 모델 저장 및 가중치 키 정규화 완료: {OUT_DIR}")

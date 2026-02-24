@@ -30,6 +30,86 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
+def apply_compressed_tensors_compat_patches() -> None:
+    """
+    NVFP4 로딩/추론 호환 패치.
+
+    - transformers 4.57.3 + compressed_tensors 0.13.0 조합에서
+      run_compressed 경로가 weight_scale을 누락시키는 문제 우회
+    - float8 scale 연산 시 torch promotion 에러 우회
+    """
+    try:
+        import compressed_tensors.quantization.lifecycle.forward as ct_forward
+        from transformers.quantizers.quantizer_compressed_tensors import (
+            CompressedTensorsHfQuantizer,
+        )
+    except Exception:
+        return
+
+    # 1) run_compressed=True 경로에서 불필요한 2차 compress를 건너뛰기
+    def _patched_process_model_before_weight_loading(self, model, **kwargs):
+        from compressed_tensors.quantization import apply_quantization_config
+
+        ct_quantization_config = self.compressor.quantization_config
+        apply_quantization_config(model, ct_quantization_config, self.run_compressed)
+
+        if (
+            self.quantization_config.is_quantization_compressed
+            or self.quantization_config.is_sparsification_compressed
+        ):
+            # run_compressed=False 경로에서는 기존 동작 유지
+            if not self.run_compressed:
+                self.compressor.compress_model(model=model)
+
+    CompressedTensorsHfQuantizer._process_model_before_weight_loading = (
+        _patched_process_model_before_weight_loading
+    )
+
+    # 2) float8 scale / global_scale 연산 promotion 에러 우회
+    original_quantize = ct_forward._quantize
+    original_dequantize = ct_forward._dequantize
+
+    def _patched_quantize(
+        x, scale, zero_point, q_min, q_max, args, dtype=None, global_scale=None
+    ):
+        if global_scale is not None:
+            if scale.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                scale = scale.to(torch.float32)
+            if global_scale.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                global_scale = global_scale.to(torch.float32)
+
+        return original_quantize(
+            x=x,
+            scale=scale,
+            zero_point=zero_point,
+            q_min=q_min,
+            q_max=q_max,
+            args=args,
+            dtype=dtype,
+            global_scale=global_scale,
+        )
+
+    def _patched_dequantize(
+        x_q, scale, zero_point=None, dtype=None, global_scale=None
+    ):
+        if global_scale is not None:
+            if scale.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                scale = scale.to(torch.float32)
+            if global_scale.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                global_scale = global_scale.to(torch.float32)
+
+        return original_dequantize(
+            x_q=x_q,
+            scale=scale,
+            zero_point=zero_point,
+            dtype=dtype,
+            global_scale=global_scale,
+        )
+
+    ct_forward._dequantize = _patched_dequantize
+    ct_forward._quantize = _patched_quantize
+
+
 # -------------------------
 # Data
 # -------------------------
@@ -191,9 +271,11 @@ class ScoreResult:
 
 
 def main():
+    apply_compressed_tensors_compat_patches()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="제출 모델 경로(./model 같은 로컬 폴더)")
-    ap.add_argument("--base", default="LGAI-EXAONE/EXAONE-4.0-1.2B", help="기본 모델(기본값: HF ID)")
+    ap.add_argument("--base", default="./base_model/base_model", help="기본 모델(기본값: HF ID)")
     ap.add_argument("--n_prompts", type=int, default=128, help="측정 프롬프트 개수")
     ap.add_argument("--start", type=int, default=0, help="MANTA에서 시작 인덱스")
     ap.add_argument("--max_len", type=int, default=512)

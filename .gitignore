@@ -42,3 +42,8 @@ __pycache__/
 /wandb/
 /trainer_output_v7_18layers/
 /models
+/base_model.tar.gz
+/model_KD_v6_GPTQ_NVFP4/
+/model_KD_v6_NVFP4/
+/trainer_output_v6.zip
+/trainer_output_v6/

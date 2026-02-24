@@ -17,6 +17,9 @@ from transformers import (
 from datasets import load_dataset
 import wandb
 
+# 제출용 모델 준비 유틸리티
+from model_utils import ensure_weight_tying, create_generation_config, normalize_safetensors_keys
+
 
 # =============================================================================
 # 1. 설정 및 하이퍼파라미터
@@ -24,7 +27,7 @@ import wandb
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(default="./base_model")
-    target_layers: int = field(default=24)  # ★ 수정: 24 (현재) → 18 (중간) → 15 (강함)
+    target_layers: int = field(default=18)  # ★ 수정: 24 (현재) → 18 (중간) → 15 (강함)
     teacher_model_path: Optional[str] = field(default=None)
 
 @dataclass
@@ -258,9 +261,37 @@ def main():
 
     trainer.train()
     
-    # [5] 저장
+    # [5] ★ 저장 전 Weight Tying 복구 및 generation_config 생성
+    print("\n" + "="*70)
+    print("[제출용 모델 준비]")
+    print("="*70)
+    
+    # Step 1: Weight tying 복구 (embedding ↔ lm_head)
+    print("\n[Step 1] Weight tying 복구...")
+    ensure_weight_tying(student_model, config=student_model.config, verbose=True)
+    
+    # Step 2: 모델 저장
+    print(f"\n[Step 2] 모델 저장 중: {training_args.output_dir}")
     student_model.save_pretrained(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
+    print(f"✓ 저장 완료")
+    
+    # Step 3: generation_config.json 생성/저장
+    print(f"\n[Step 3] generation_config 생성...")
+    create_generation_config(
+        student_model, 
+        tokenizer=tokenizer,
+        output_dir=training_args.output_dir,
+        verbose=True
+    )
+    
+    # Step 4: safetensors 키 정규화
+    print(f"\n[Step 4] safetensors 키 정규화...")
+    normalize_safetensors_keys(training_args.output_dir, verbose=True)
+    
+    print("\n" + "="*70)
+    print("✓ 제출용 모델 준비 완료!")
+    print("="*70)
     
     # ★ WandB 종료
     wandb.finish()

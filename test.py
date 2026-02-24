@@ -18,7 +18,9 @@ DACON Aimers 8기 모델 경량화 해커톤 - 로컬 점수 추정기 (비공�
 """
 
 import argparse
+import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Dict
@@ -89,14 +91,35 @@ def try_measure_token_time_vllm(model_path: str, tokenizer_path: str, prompts: L
     """
     from vllm import LLM, SamplingParams
 
-    llm = LLM(
-        model=model_path,
-        tokenizer=tokenizer_path,
-        trust_remote_code=True,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.70,
-        max_num_seqs=16,
-    )
+    # 모델의 max_position_embeddings를 config.json에서 읽기
+    max_model_len = None
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                max_model_len = config.get("max_position_embeddings")
+                if max_model_len:
+                    print(f"  [INFO] Model config에서 max_model_len 읽음: {max_model_len}")
+    except Exception as e:
+        print(f"  [WARN] Config 읽기 실패: {e}")
+
+    llm_kwargs = {
+        "model": model_path,
+        "tokenizer": tokenizer_path,
+        "trust_remote_code": True,
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.70,  # 0.85 → 0.70 → 0.60 (더 안전한 마진)
+        "max_num_seqs": 32,
+        "max_model_len": 65536,
+        "enable_prefix_caching": True,
+    }
+    
+    # max_model_len을 성공적으로 읽었으면 추가
+    if max_model_len:
+        llm_kwargs["max_model_len"] = max_model_len
+
+    llm = LLM(**llm_kwargs)
 
     params = SamplingParams(
         temperature=0.0,

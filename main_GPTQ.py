@@ -12,7 +12,7 @@ from llmcompressor.modifiers.quantization import GPTQModifier
 # 1. 설정 및 경로
 # =============================================================================
 MODEL_ID = "./models/trainer_output_v6"     
-OUT_DIR  = "./model_KD_v6_GPTQ_v2"          
+OUT_DIR  = "./model_KD_v6_GPTQ_NVFP4"          
 
 DATASET_ID = "LGAI-EXAONE/MANTA-1M"
 DATASET_SPLIT = "train"
@@ -52,7 +52,7 @@ print(f"[INFO] GPTQ 진행 (Samples: {NUM_CALIBRATION_SAMPLES}, Max Len: {MAX_SE
 
 recipe = [
     GPTQModifier(
-        scheme="W4A16",
+        scheme="NVFP4",
         targets=["Linear"],
         ignore=["embed_tokens", "lm_head"],
         # [추가] 가중치 업데이트 시의 감쇠율을 조절하여 급격한 변화 방지
